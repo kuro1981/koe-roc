@@ -3,6 +3,8 @@
 #include <FS.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
 
 // WAVヘッダ構造体
 struct __attribute__((packed)) WavHeader {
@@ -51,6 +53,11 @@ float latestVolume = 0.0f;
 char currentFileName[32] = "";
 int fileCount = 0;
 
+// WiFiおよびサーバー設定
+String wifiSsid = "YOUR_WIFI_SSID";
+String wifiPass = "YOUR_WIFI_PASSWORD";
+String uploadUrl = "http://192.168.1.100:5000/upload";
+
 // マイク入力バッファ (4面バッファ・公式サンプル移植)
 const size_t record_number = 4;
 const size_t record_length = 1024;
@@ -71,6 +78,14 @@ void stopWiFiServer();
 void handleRoot();
 void handleDelete();
 
+// 新規プロトタイプ
+void loadConfig();
+void saveConfig(String ssid, String pass, String url);
+void handleSaveConfig();
+void uploadAllFiles();
+void drawGaugeUI(unsigned long pressedMs);
+void handleShortPressAction();
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -88,11 +103,6 @@ void setup() {
     canvas.setTextDatum(top_left);
     M5.Display.clear(TFT_BLACK);
 
-    // WebServer ルートハンドラの設定
-    server.on("/", handleRoot);
-    server.on("/delete", handleDelete);
-    server.serveStatic("/", LittleFS, "/");
-
     // 明示的なボタンピンの入力モード設定
     pinMode(35, INPUT_PULLUP);
     pinMode(37, INPUT_PULLUP);
@@ -107,6 +117,15 @@ void setup() {
     }
     Serial.printf("LittleFS Storage: Total=%d KB, Used=%d KB\n",
                   LittleFS.totalBytes() / 1024, LittleFS.usedBytes() / 1024);
+
+    // 設定ロード
+    loadConfig();
+
+    // WebServer ルートハンドラの設定
+    server.on("/", handleRoot);
+    server.on("/delete", handleDelete);
+    server.on("/save-config", handleSaveConfig);
+    server.serveStatic("/", LittleFS, "/");
 
     // マイクの初期設定
     auto mic_cfg = M5.Mic.config();
@@ -150,100 +169,86 @@ void loop() {
         server.handleClient();
     }
 
-    // 3. ボタン入力判定用の共通変数
-    static unsigned long lastActionTime = 0;
-    static bool btnBLongPressedHandled = false;
-    
-    bool triggerShortPress = false;
-    bool triggerLongPressB = false;
+    // 3. ボタンBの押し込み状態追跡と長押しゲージUI
+    static bool isBtnBPressed = false;
+    static unsigned long btnBPressStartTime = 0;
+    static bool btnBActionTriggered = false;
 
-    // --- A. ボタンBの長押し判定 (1秒) ---
-    if (M5.BtnB.pressedFor(1000)) {
-        if (!btnBLongPressedHandled) {
-            btnBLongPressedHandled = true;
-            triggerLongPressB = true;
+    if (M5.BtnB.isPressed()) {
+        if (!isBtnBPressed) {
+            isBtnBPressed = true;
+            btnBPressStartTime = now;
+            btnBActionTriggered = false;
         }
-    }
 
-    // --- B. 各種ボタンの短押しトリガー判定 ---
-    // 1) ボタンBが離されたとき (長押し処理の後でなければ短押しと判定)
-    if (M5.BtnB.wasReleased()) {
-        if (btnBLongPressedHandled) {
-            btnBLongPressedHandled = false; // 長押し完了後のリリース時はフラグをクリアするだけ
-        } else {
-            triggerShortPress = true;
-        }
-    }
-    // 2) 電源ボタン(BtnPWR)が押されたとき (予備)
-    if (M5.BtnPWR.wasPressed()) {
-        triggerShortPress = true;
-    }
-    // 3) 前面ボタンA(BtnA)が押されたとき (壊れているが念のため残す)
-    if (M5.BtnA.wasPressed()) {
-        triggerShortPress = true;
-    }
+        unsigned long elapsed = now - btnBPressStartTime;
 
-    // --- C. アクション実行 (500msガード付) ---
-    if (triggerLongPressB) {
-        if (now - lastActionTime > 500) {
-            lastActionTime = now;
-            Serial.println("Action: BtnB Long Pressed");
+        // 5秒以上押されていてアクション未実行ならAPモードをその場で確定起動
+        if (elapsed >= 5000 && !btnBActionTriggered) {
+            btnBActionTriggered = true;
+            Serial.println("Action: BtnB 5s Long Pressed - Trigger AP Mode");
+            
+            // 確定のフラッシュフィードバック
+            M5.Display.fillScreen(TFT_PURPLE);
+            delay(150);
 
-            if (currentState == STATE_IDLE) {
-                // WiFiサーバー起動
+            if (currentState == STATE_WIFI_SERVER) {
+                stopWiFiServer();
+                currentState = STATE_IDLE;
+            } else {
+                if (currentState == STATE_RECORDING || currentState == STATE_PAUSED) {
+                    stopRecording(true);
+                }
                 currentState = STATE_WIFI_SERVER;
                 startWiFiServer();
-            } else if (currentState == STATE_RECORDING || currentState == STATE_PAUSED) {
-                // 録音の完全停止（保存）
-                stopRecording(true);
-                currentState = STATE_IDLE;
-            } else if (currentState == STATE_WIFI_SERVER) {
-                // WiFiサーバー停止
-                stopWiFiServer();
-                currentState = STATE_IDLE;
             }
             drawUI();
         }
+
+        // 長押し中は毎フレーム専用ゲージUIを描画 (確定後はスキップ)
+        if (isBtnBPressed && !btnBActionTriggered) {
+            drawGaugeUI(elapsed);
+            delay(5);
+            return; // 通常のUI更新等はスキップ
+        }
     }
 
-    if (triggerShortPress) {
-        if (now - lastActionTime > 500) { // 500ms強力デバウンスガード
-            lastActionTime = now;
-            Serial.println("Action: Short Press Triggered");
+    // ボタンBが離されたときの判定
+    if (M5.BtnB.wasReleased()) {
+        isBtnBPressed = false;
+        unsigned long elapsed = now - btnBPressStartTime;
 
-            if (currentState == STATE_IDLE) {
-                // 録音開始
-                if (startNewRecording()) {
-                    currentState = STATE_RECORDING;
+        if (btnBActionTriggered) {
+            btnBActionTriggered = false; // 既に5秒長押しで処理済みの場合は何もしない
+        } else {
+            // 1秒以上5秒未満で離された場合 -> 自動アップロード実行
+            if (elapsed >= 1000) {
+                Serial.println("Action: BtnB 1s-5s Long Pressed - Trigger Upload");
+                if (currentState == STATE_RECORDING || currentState == STATE_PAUSED) {
+                    stopRecording(true);
+                    currentState = STATE_IDLE;
                 }
-            } else if (currentState == STATE_RECORDING) {
-                // 一時停止
-                M5.Mic.end();
-                currentState = STATE_PAUSED;
-                Serial.println("Recording Paused");
-            } else if (currentState == STATE_PAUSED) {
-                // 再開
-                recordStartTimeMs = millis() - recordElapsedTimeMs;
-                M5.Mic.begin();
-                rec_record_idx = 2;
-                draw_record_idx = 0;
-                M5.Mic.record(&rec_data[0 * record_length], record_length);
-                M5.Mic.record(&rec_data[1 * record_length], record_length);
-                currentState = STATE_RECORDING;
-                Serial.println("Recording Resumed");
-            } else if (currentState == STATE_WIFI_SERVER) {
-                // WiFiサーバー停止
-                stopWiFiServer();
-                currentState = STATE_IDLE;
+                uploadAllFiles();
+                drawUI();
             }
-            drawUI();
+            // 1秒未満で離された場合 -> 通常の短押し (開始/一時停止/再開/WiFi停止)
+            else {
+                Serial.println("Action: Short Press Triggered via BtnB");
+                handleShortPressAction();
+            }
         }
     }
 
-    // 5. 画面描画の定期更新 (録音中は細かく、それ以外は適度に更新)
+    // 予備ボタン（電源ボタン、前面ボタンA）の短押し判定
+    if (M5.BtnPWR.wasPressed() || M5.BtnA.wasPressed()) {
+        Serial.println("Action: Short Press Triggered via Fallback Button");
+        handleShortPressAction();
+    }
+
+    // 5. 画面描画の定期更新 (録音中以外も含む。長押し中以外のみ)
     static unsigned long lastUIUpdate = 0;
     unsigned long uiUpdateInterval = (currentState == STATE_RECORDING) ? 100 : 250;
-    if (now - lastUIUpdate > uiUpdateInterval) {
+    if (now - lastUIUpdate > uiUpdateInterval && !isBtnBPressed) {
         lastUIUpdate = now;
         drawUI();
     }
@@ -513,7 +518,7 @@ void stopWiFiServer() {
     Serial.println("WiFi AP stopped.");
 }
 
-// Webサーバーのメインページ（ファイル一覧とダウンロード）の配信
+// Webサーバーのメインページ（ファイル一覧とダウンロード、設定フォーム）の配信
 void handleRoot() {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<title>koe-roc Voice Files</title>";
@@ -525,6 +530,7 @@ void handleRoot() {
     html += "a{color:#0a84ff;text-decoration:none;}a:hover{text-decoration:underline;}";
     html += ".btn-del{color:#ff453a;margin-left:15px;}";
     html += ".info{background:#1c1c1e;padding:15px;border-radius:8px;margin-bottom:20px;}";
+    html += "h3{margin-top:0;color:#ff9500;}";
     html += "</style></head><body>";
     html += "<h1>koe-roc WAV Files</h1>";
     
@@ -533,6 +539,20 @@ void handleRoot() {
     uint32_t used = LittleFS.usedBytes();
     html += "<div class='info'>";
     html += "Storage: " + String(used / 1024) + " KB / " + String(total / 1024) + " KB used (" + String((total - used) / 1024) + " KB free)<br>";
+    html += "</div>";
+
+    // 設定フォームの追加
+    html += "<div class='info'>";
+    html += "<h3>System Configuration</h3>";
+    html += "<form action='/save-config' method='POST'>";
+    html += "  <label>WiFi SSID:</label><br>";
+    html += "  <input type='text' name='ssid' value='" + wifiSsid + "' style='width:90%;max-width:300px;padding:6px;margin:4px 0;background:#333;color:#fff;border:1px solid #555;border-radius:4px;'><br>";
+    html += "  <label>WiFi Password:</label><br>";
+    html += "  <input type='password' name='pass' value='" + wifiPass + "' style='width:90%;max-width:300px;padding:6px;margin:4px 0;background:#333;color:#fff;border:1px solid #555;border-radius:4px;'><br>";
+    html += "  <label>Upload URL:</label><br>";
+    html += "  <input type='text' name='url' value='" + uploadUrl + "' style='width:90%;max-width:400px;padding:6px;margin:4px 0;background:#333;color:#fff;border:1px solid #555;border-radius:4px;'><br>";
+    html += "  <input type='submit' value='Save Config' style='background:#34c759;color:#fff;border:none;padding:8px 15px;border-radius:4px;cursor:pointer;margin-top:8px;'>";
+    html += "</form>";
     html += "</div>";
 
     html += "<table><tr><th>File Name</th><th>Size</th><th>Actions</th></tr>";
@@ -593,4 +613,320 @@ void handleDelete() {
     // ルートページへリダイレクト
     server.sendHeader("Location", "/");
     server.send(303);
+}
+
+// === 新規追加関数群 ===
+
+// WiFi設定ロード
+void loadConfig() {
+    if (!LittleFS.exists("/config.json")) {
+        Serial.println("Config file not found. Creating default...");
+        saveConfig(wifiSsid, wifiPass, uploadUrl);
+        return;
+    }
+
+    File configFile = LittleFS.open("/config.json", FILE_READ);
+    if (!configFile) {
+        Serial.println("Failed to open config file for reading");
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, configFile);
+    configFile.close();
+
+    if (error) {
+        Serial.println("Failed to parse config file. Using defaults.");
+        return;
+    }
+
+    if (doc["wifi_ssid"].is<String>()) wifiSsid = doc["wifi_ssid"].as<String>();
+    if (doc["wifi_pass"].is<String>()) wifiPass = doc["wifi_pass"].as<String>();
+    if (doc["upload_url"].is<String>()) uploadUrl = doc["upload_url"].as<String>();
+
+    Serial.println("Config loaded successfully:");
+    Serial.printf("  SSID: %s\n", wifiSsid.c_str());
+    Serial.printf("  URL: %s\n", uploadUrl.c_str());
+}
+
+// WiFi設定保存
+void saveConfig(String ssid, String pass, String url) {
+    File configFile = LittleFS.open("/config.json", FILE_WRITE);
+    if (!configFile) {
+        Serial.println("Failed to open config file for writing");
+        return;
+    }
+
+    JsonDocument doc;
+    doc["wifi_ssid"] = ssid;
+    doc["wifi_pass"] = pass;
+    doc["upload_url"] = url;
+
+    if (serializeJson(doc, configFile) == 0) {
+        Serial.println("Failed to write to config file");
+    } else {
+        Serial.println("Config saved successfully");
+    }
+    configFile.close();
+
+    wifiSsid = ssid;
+    wifiPass = pass;
+    uploadUrl = url;
+}
+
+// 設定保存用Webサーバーエンドポイント
+void handleSaveConfig() {
+    if (server.hasArg("ssid") && server.hasArg("pass") && server.hasArg("url")) {
+        String ssid = server.arg("ssid");
+        String pass = server.arg("pass");
+        String url = server.arg("url");
+        saveConfig(ssid, pass, url);
+        
+        String res = "<html><body style='background:#121212;color:#e0e0e0;font-family:sans-serif;padding:20px;text-align:center;'>";
+        res += "<h2>Config Saved Successfully!</h2>";
+        res += "<p>SSID: " + ssid + "</p>";
+        res += "<a href='/' style='color:#0a84ff;text-decoration:none;'>Back to File List</a>";
+        res += "</body></html>";
+        server.send(200, "text/html", res);
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+// 画面進捗表示付きのアップロード処理
+void uploadAllFiles() {
+    M5.Mic.end(); // マイクを確実に停止
+
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextSize(1.2);
+    M5.Display.setTextColor(TFT_YELLOW);
+    M5.Display.drawString("Connecting to WiFi...", 10, 10);
+    M5.Display.drawString(wifiSsid.substring(0, 15).c_str(), 10, 25);
+    Serial.printf("Connecting to WiFi: %s...\n", wifiSsid.c_str());
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
+    unsigned long startConnect = millis();
+    bool connected = false;
+    while (millis() - startConnect < 15000) { // 15秒タイムアウト
+        M5.update();
+        if (WiFi.status() == WL_CONNECTED) {
+            connected = true;
+            break;
+        }
+        int dots = ((millis() - startConnect) / 500) % 4;
+        String dotStr = "";
+        for (int i = 0; i < dots; i++) dotStr += ".";
+        M5.Display.fillRect(10, 45, 100, 15, TFT_BLACK);
+        M5.Display.drawString(dotStr.c_str(), 10, 45);
+        delay(100);
+    }
+
+    if (!connected) {
+        Serial.println("WiFi connection failed!");
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.drawString("Connection Failed!", 10, 45);
+        delay(2000);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
+    Serial.print("WiFi Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.drawString("Connected!", 10, 45);
+    
+    // IPアドレスを画面に大きく表示
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("Connected to WiFi", 8, 10);
+    M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.drawString(WiFi.localIP().toString().c_str(), 8, 30);
+    delay(3000); // 確認しやすいように3秒表示
+
+    // ルートディレクトリをスキャンしてWAVファイルを抽出
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    int totalFiles = 0;
+    while (file) {
+        String name = file.name();
+        if (name.endsWith(".wav")) {
+            totalFiles++;
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+
+    if (totalFiles == 0) {
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.drawString("No files to upload.", 10, 30);
+        delay(2000);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
+    root = LittleFS.open("/");
+    file = root.openNextFile();
+    int currentIdx = 0;
+
+    while (file) {
+        String name = file.name();
+        if (name.endsWith(".wav")) {
+            currentIdx++;
+            String displayName = name;
+            if (displayName.startsWith("/")) {
+                displayName = displayName.substring(1);
+            }
+
+            M5.Display.clear(TFT_BLACK);
+            M5.Display.setTextColor(TFT_WHITE);
+            M5.Display.drawString("Uploading...", 10, 8);
+            M5.Display.setTextSize(1);
+            M5.Display.drawString(displayName.c_str(), 10, 24);
+            
+            char progressStr[32];
+            snprintf(progressStr, sizeof(progressStr), "File: %d / %d", currentIdx, totalFiles);
+            M5.Display.drawString(progressStr, 10, 40);
+
+            Serial.printf("Uploading file %d/%d: %s\n", currentIdx, totalFiles, name.c_str());
+
+            HTTPClient http;
+            http.begin(uploadUrl);
+            http.setTimeout(15000); // アップロードは少しタイムアウト長めに(15秒)
+            http.addHeader("Content-Type", "audio/wav");
+            http.addHeader("X-File-Name", displayName);
+
+            File uploadFile = LittleFS.open(name, FILE_READ);
+            int httpResponseCode = -1;
+            if (uploadFile) {
+                httpResponseCode = http.sendRequest("POST", &uploadFile, uploadFile.size());
+                uploadFile.close();
+            } else {
+                Serial.println("Failed to open file for read");
+            }
+
+            if (httpResponseCode == 200 || httpResponseCode == 201) {
+                Serial.printf("Upload success for %s. Response: %d\n", name.c_str(), httpResponseCode);
+                M5.Display.setTextColor(TFT_GREEN);
+                M5.Display.drawString("Upload OK!", 10, 56);
+                
+                // 成功したらファイルをクローズ後に削除
+                String fileToDelete = name;
+                file.close(); // ディレクトリ内のポインタ維持のため閉じる
+                LittleFS.remove(fileToDelete);
+                Serial.printf("Deleted local file: %s\n", fileToDelete.c_str());
+                
+                // ディレクトリポインタを再生成して次を探索
+                root.close();
+                root = LittleFS.open("/");
+                // 現在のインデックス分だけスキップ
+                for (int i = 0; i < currentIdx; i++) {
+                    file = root.openNextFile();
+                }
+                continue; // ポインタ引き直し後、ループ継続
+            } else {
+                Serial.printf("Upload failed for %s. Error: %d\n", name.c_str(), httpResponseCode);
+                M5.Display.setTextColor(TFT_RED);
+                M5.Display.drawString("Upload Failed!", 10, 56);
+                delay(2000);
+            }
+            http.end();
+            delay(500);
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.drawString("All Done!", 10, 30);
+    delay(2000);
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+}
+
+// 長押し進行中ゲージUI描画
+void drawGaugeUI(unsigned long pressedMs) {
+    canvas.fillRect(0, 0, canvas.width(), canvas.height(), 0x101010); // 深いグレー背景
+
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextSize(1.2);
+    canvas.drawString("MODE SELECT", 8, 8);
+
+    // 5秒を最大値としてマッピング
+    float progress = (float)pressedMs / 5000.0f;
+    if (progress > 1.0f) progress = 1.0f;
+
+    int barMaxWidth = canvas.width() - 32;
+    int barWidth = barMaxWidth * progress;
+
+    bool reached1s = (pressedMs >= 1000);
+    bool reached5s = (pressedMs >= 5000);
+
+    uint32_t barColor = TFT_BLUE;
+    if (reached5s) {
+        barColor = 0x780F; // 紫色
+    } else if (reached1s) {
+        barColor = TFT_GREEN;
+    }
+
+    // 枠
+    canvas.drawRect(16, 26, barMaxWidth, 12, TFT_DARKGRAY);
+    // バー本体
+    if (barWidth > 2) {
+        canvas.fillRect(17, 27, barWidth - 2, 10, barColor);
+    }
+
+    // 操作ガイドメッセージ
+    canvas.setTextSize(1);
+    if (reached5s) {
+        canvas.setTextColor(TFT_MAGENTA);
+        canvas.drawString("> RELEASE FOR AP MODE <", 16, 44);
+    } else if (reached1s) {
+        canvas.setTextColor(TFT_GREEN);
+        canvas.drawString("> RELEASE FOR UPLOAD <", 16, 44);
+    } else {
+        canvas.setTextColor(TFT_LIGHTGRAY);
+        canvas.drawString("Keep pressing...", 16, 44);
+    }
+
+    canvas.pushSprite(0, 0);
+}
+
+// 共通短押し処理アクション
+void handleShortPressAction() {
+    static unsigned long lastActionTime = 0;
+    unsigned long now = millis();
+    if (now - lastActionTime > 500) { // 500ms強力デバウンスガード
+        lastActionTime = now;
+        
+        if (currentState == STATE_IDLE) {
+            if (startNewRecording()) {
+                currentState = STATE_RECORDING;
+            }
+        } else if (currentState == STATE_RECORDING) {
+            M5.Mic.end();
+            currentState = STATE_PAUSED;
+            Serial.println("Recording Paused");
+        } else if (currentState == STATE_PAUSED) {
+            recordStartTimeMs = millis() - recordElapsedTimeMs;
+            M5.Mic.begin();
+            rec_record_idx = 2;
+            draw_record_idx = 0;
+            M5.Mic.record(&rec_data[0 * record_length], record_length);
+            M5.Mic.record(&rec_data[1 * record_length], record_length);
+            currentState = STATE_RECORDING;
+            Serial.println("Recording Resumed");
+        } else if (currentState == STATE_WIFI_SERVER) {
+            stopWiFiServer();
+            currentState = STATE_IDLE;
+        }
+        drawUI();
+    }
 }

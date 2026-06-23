@@ -30,3 +30,9 @@ Thumbs.db
 *.log
 *.bak
 *.swp
+
+# PlatformIO auto-generated README templates
+include/README
+lib/README
+test/README
+

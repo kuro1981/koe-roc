@@ -19,6 +19,9 @@
             platformio
             git
             linuxPackages.usbip
+            kmod
+            python3
+            uv
           ];
 
           shellHook = ''
